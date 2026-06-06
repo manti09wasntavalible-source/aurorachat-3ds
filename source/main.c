@@ -19,6 +19,8 @@
 #define HTTP_PORT "6767"
 #define HTTP_OR_HTTPS "http"
 #define SOCKET_PORT "3033"
+#define CHANNELS 2
+
 
 char token[300];
 
