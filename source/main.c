@@ -49,10 +49,10 @@ void audioInitBuffers() {
     memset(&waveBufB, 0, sizeof(waveBufB));
 
     waveBufA.data_vaddr = audioData;
-    waveBufA.nsamples = audioSize / sizeof(int16_t);
+    waveBufA.nsamples = audioSize / (sizeof(int16_t) * CHANNELS);
 
     waveBufB.data_vaddr = audioData;
-    waveBufB.nsamples = audioSize / sizeof(int16_t);
+    waveBufB.nsamples = audioSize / (sizeof(int16_t) * CHANNELS);
 
     ndspChnWaveBufAdd(1, &waveBufA);
 }
@@ -327,34 +327,44 @@ LightEvent audioEvent;
 volatile bool quit = false;
 
 void loadAudio(const char* filename) {
-    FILE* f = fopen(filename, "rb");
-    if (!f) return;
+    OggOpusFile *file = op_open_file(filename, NULL);
+    if (!file) return;
 
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    rewind(f);
-
-    fseek(f, 44, SEEK_SET);
-
-    audioSize = size - 44;
-
-    audioData = (int16_t*)linearAlloc(audioSize);
-    if (!audioData) {
-        fclose(f);
+    int64_t totalFrames = op_pcm_total(file, -1);
+    if (totalFrames <= 0) {
+        op_free(file);
         return;
     }
 
-    fread(audioData, 1, audioSize, f);
-    fclose(f);
+    audioSize = (u32)(totalFrames * CHANNELS * sizeof(int16_t));
+    audioData = (int16_t*)linearAlloc(audioSize);
+    if (!audioData) {
+        op_free(file);
+        return;
+    }
+
+    int64_t framesRead = 0;
+    while (framesRead < totalFrames) {
+        int ret = op_read_stereo(file, audioData + (framesRead * CHANNELS), (int)(totalFrames - framesRead));
+        if (ret < 0) {
+            linearFree(audioData);
+            audioData = NULL;
+            audioSize = 0;
+            op_free(file);
+            return;
+        }
+        framesRead += ret;
+    }
 
     DSP_FlushDataCache(audioData, audioSize);
+    op_free(file);
 }
 
 bool fillBuffer(OggOpusFile *file, ndspWaveBuf *buf) {
     int total = 0;
     while (total < SAMPLES_PER_BUF) {
         int16_t *ptr = buf->data_pcm16 + (total * CHANNELS);
-        int ret = op_read_stereo(file, ptr, (SAMPLES_PER_BUF - total) * CHANNELS);
+        int ret = op_read_stereo(file, ptr, SAMPLES_PER_BUF - total);
         
         if (ret <= 0) {
             // End of stream or error, try to loop
@@ -365,7 +375,6 @@ bool fillBuffer(OggOpusFile *file, ndspWaveBuf *buf) {
             if (op_pcm_seek(file, 0) < 0) {
                 break; // Failed to seek, can't loop
             }
-            // After seeking, try to read again
             continue;
         }
         total += ret;
@@ -383,17 +392,14 @@ bool fillBufferNoLoop(OggOpusFile *file, ndspWaveBuf *buf) {
     int total = 0;
     while (total < SAMPLES_PER_BUF) {
         int16_t *ptr = buf->data_pcm16 + (total * CHANNELS);
-        int ret = op_read_stereo(file, ptr, (SAMPLES_PER_BUF - total) * CHANNELS);
+        int ret = op_read_stereo(file, ptr, SAMPLES_PER_BUF - total);
         
         if (ret <= 0) {
             // End of stream or error — try to loop
             if (ret == OP_HOLE || ret == OPUS_INVALID_PACKET) {
                 continue; // Skip invalid data, keep reading
             }
-            // Attempt to seek to beginning of stream
             break; // Failed to seek — can't loop
-            // After seeking, try to read again
-            continue;
         }
         total += ret;
     }
@@ -418,8 +424,7 @@ void audioThread(void *arg) {
                 if (!fillBuffer(file, &waveBufs[i])) { quit = true; return; }
             }
         }
-        svcSleepThread(10000000L);
-//        LightEvent_Wait(&audioEvent);
+        LightEvent_Wait(&audioEvent);
     }
     return;
 }
@@ -677,7 +682,7 @@ void audioLoopCheck() {
     if (waveBufA.status == NDSP_WBUF_DONE || waveBufA.status == NDSP_WBUF_FREE) {
 
         waveBufA.data_vaddr = audioData;
-        waveBufA.nsamples = audioSize / sizeof(int16_t);
+        waveBufA.nsamples = audioSize / (sizeof(int16_t) * CHANNELS);
 
         ndspChnWaveBufAdd(1, &waveBufA);
     }
@@ -685,7 +690,7 @@ void audioLoopCheck() {
     if (waveBufB.status == NDSP_WBUF_DONE || waveBufB.status == NDSP_WBUF_FREE) {
 
         waveBufB.data_vaddr = audioData;
-        waveBufB.nsamples = audioSize / sizeof(int16_t);
+        waveBufB.nsamples = audioSize / (sizeof(int16_t) * CHANNELS);
 
         ndspChnWaveBufAdd(1, &waveBufB);
     }
@@ -762,8 +767,8 @@ int main() {
     // channel 1 for bgm
     ndspChnReset(1);
     ndspChnSetInterp(1, NDSP_INTERP_LINEAR);
-    ndspChnSetRate(1, 22050);
-    ndspChnSetFormat(1, NDSP_FORMAT_MONO_PCM16);
+    ndspChnSetRate(1, SAMPLE_RATE);
+    ndspChnSetFormat(1, NDSP_FORMAT_STEREO_PCM16);
 
     int animCounter = 0;
     int loadingFrame = 0;
@@ -771,10 +776,23 @@ int main() {
 
     int scene = 1;
 
-    // load and play music
-    loadAudio("romfs:/auc.wav");
-    ndspChnWaveBufAdd(1, &waveBufA);
-    ndspChnWaveBufAdd(1, &waveBufB);
+    // load and play music by streaming Opus chunks
+    OggOpusFile *file = op_open_file("romfs:/auc.opus", NULL);
+    if (file) {
+        audioBuffer = linearAlloc(WAVEBUF_SIZE * 2);
+        if (audioBuffer) {
+            memset(waveBufs, 0, sizeof(waveBufs));
+            for (int i = 0; i < 2; i++) {
+                waveBufs[i].data_pcm16 = audioBuffer + (i * SAMPLES_PER_BUF * CHANNELS);
+                waveBufs[i].status = NDSP_WBUF_DONE;
+            }
+
+            LightEvent_Init(&audioEvent, RESET_ONESHOT);
+            Thread thread = threadCreate(audioThread, file, 32 * 1024, 0x18, 1, false);
+            fillBuffer(file, &waveBufs[0]);
+            fillBuffer(file, &waveBufs[1]);
+        }
+    }
 
     char* newsHeader = "Failed to load news header";
     char* newsDesc = "Failed to load news description";
